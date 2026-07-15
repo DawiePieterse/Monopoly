@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Property Party</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<style>
+  html, body { height: 100%; overflow: hidden; }
+  body { font-family: 'Nunito', sans-serif; background: #FDF6E9; }
+  .font-display { font-family: 'Fredoka', sans-serif; }
+  .board-cell { display: flex; align-items: center; justify-content: center; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  @keyframes popIn { 0% { transform: scale(0.7); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+  .pop-in { animation: popIn 0.22s ease-out; }
+  @keyframes tokenBounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+  .token-bounce { animation: tokenBounce 0.6s ease-in-out infinite; }
+  @keyframes diceRoll { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  .dice-rolling { animation: diceRoll 0.4s linear infinite; }
+</style>
+</head>
+<body class="text-slate-800">
+<div id="app" class="w-screen h-screen"></div>
+
+<script>
+/* =========================================================================
+   PART 1: CORE GAME LOGIC (pure — no DOM/network). Fuzz-tested separately
+   with a Node harness before being embedded here verbatim.
+   ========================================================================= */
+
+const START_CASH = 1000;
+const GO_BONUS = 200;
+const PARKING_BONUS = 50;
+const MAX_ROUNDS = 25;
+const BOARD_SIZE = 24;
+
+const GROUP_COLORS = {
+  red: '#EF4444', orange: '#F59E0B', yellow: '#EAB308',
+  green: '#22C55E', blue: '#3B82F6', purple: '#A855F7'
+};
+const GROUP_ICONS = {
+  red: '🍒', orange: '🍁', yellow: '🌻', green: '🌲', blue: '🌊', purple: '💎'
+};
+
+const BOARD = [
+  { idx: 0, type: 'go', name: 'GO', icon: '🏁' },
+  { idx: 1, type: 'property', name: 'Sunny Lane', group: 'red', price: 60, rent: 10 },
+  { idx: 2, type: 'property', name: 'Berry Street', group: 'red', price: 60, rent: 10 },
+  { idx: 3, type: 'surprise', name: 'Surprise', icon: '❓' },
+  { idx: 4, type: 'property', name: 'Cherry Court', group: 'red', price: 70, rent: 12 },
+  { idx: 5, type: 'property', name: 'Pumpkin Path', group: 'orange', price: 100, rent: 16 },
+  { idx: 6, type: 'jail', name: 'Jail', icon: '🔒' },
+  { idx: 7, type: 'property', name: 'Maple Avenue', group: 'orange', price: 100, rent: 16 },
+  { idx: 8, type: 'property', name: 'Autumn Row', group: 'orange', price: 120, rent: 18 },
+  { idx: 9, type: 'property', name: 'Lemon Lane', group: 'yellow', price: 140, rent: 22 },
+  { idx: 10, type: 'property', name: 'Sunflower Street', group: 'yellow', price: 140, rent: 22 },
+  { idx: 11, type: 'property', name: 'Golden Meadow', group: 'yellow', price: 160, rent: 24 },
+  { idx: 12, type: 'parking', name: 'Free Parking', icon: '🎉' },
+  { idx: 13, type: 'property', name: 'Forest Trail', group: 'green', price: 180, rent: 28 },
+  { idx: 14, type: 'property', name: 'Meadow Way', group: 'green', price: 180, rent: 28 },
+  { idx: 15, type: 'surprise', name: 'Surprise', icon: '❓' },
+  { idx: 16, type: 'property', name: 'Pine Grove', group: 'green', price: 200, rent: 30 },
+  { idx: 17, type: 'property', name: 'Ocean Drive', group: 'blue', price: 220, rent: 35 },
+  { idx: 18, type: 'gotojail', name: 'Go To Jail', icon: '🚔' },
+  { idx: 19, type: 'property', name: 'River Road', group: 'blue', price: 220, rent: 35 },
+  { idx: 20, type: 'property', name: 'Lake View', group: 'blue', price: 240, rent: 38 },
+  { idx: 21, type: 'property', name: 'Diamond Drive', group: 'purple', price: 260, rent: 42 },
+  { idx: 22, type: 'property', name: 'Crystal Court', group: 'purple', price: 280, rent: 45 },
+  { idx: 23, type: 'property', name: 'Star Plaza', group: 'purple', price: 300, rent: 48 }
+];
+const JAIL_INDEX = 6;
+
+const CARDS = [
+  { text: 'Lemonade stand profits! Collect $50.', effect: { type: 'cash', amount: 50 } },
+  { text: 'You found a $20 bill on the sidewalk!', effect: { type: 'cash', amount: 20 } },
+  { text: 'You dropped your ice cream. Pay $10 for a new one.', effect: { type: 'cash', amount: -10 } },
+  { text: 'Birthday money from Grandma! Collect $100.', effect: { type: 'cash', amount: 100 } },
+  { text: 'You broke a window playing ball. Pay $30.', effect: { type: 'cash', amount: -30 } },
+  { text: 'Take a shortcut! Move forward 3 spaces.', effect: { type: 'move', spaces: 3 } },
+  { text: 'Go back 2 spaces to tie your shoe.', effect: { type: 'move', spaces: -2 } },
+  { text: 'Uh oh, go straight to Jail!', effect: { type: 'jail' } },
+  { text: 'You won the school raffle! Collect $75.', effect: { type: 'cash', amount: 75 } },
+  { text: 'Pay $25 for losing a game of tag.', effect: { type: 'cash', amount: -25 } },
+  { text: 'Move forward 5 spaces to grab a snack.', effect: { type: 'move', spaces: 5 } },
+  { text: 'Charity bake sale — pay $15 to help out.', effect: { type: 'cash', amount: -15 } }
+];
+
+const PLAYER_COLORS = ['#EF4444', '#F59E0B', '#10B981', '#3B82F6', '#8B5CF6', '#EC4899'];
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function logMsg(state, text) {
+  state.log.push(text);
+  if (state.log.length > 40) state.log.shift();
+}
+function currentPlayer(state) { return state.players[state.turnIndex]; }
+function isCurrentPlayer(state, clientId) {
+  const p = currentPlayer(state);
+  return p && p.clientId === clientId;
+}
+function getPlayer(state, clientId) { return state.players.find(p => p.clientId === clientId); }
+function ownedPropertyValue(state, clientId) {
+  let total = 0;
+  for (const idxStr of Object.keys(state.propertyOwners)) {
+    if (state.propertyOwners[idxStr] === clientId) total += BOARD[idxStr].price;
+  }
+  return total;
+}
+function ownsFullGroup(state, clientId, group) {
+  const spaces = BOARD.filter(s => s.type === 'property' && s.group === group);
+  return spaces.every(s => state.propertyOwners[s.idx] === clientId);
+}
+function createInitialState(roomCode) {
+  return {
+    roomCode, phase: 'lobby', players: [], turnIndex: 0, turnCount: 0,
+    turnStage: 'awaiting-roll', dice: null, propertyOwners: {}, cardDeck: [],
+    log: [], winnerId: null
+  };
+}
+function addPlayer(state, clientId, name) {
+  const existing = getPlayer(state, clientId);
+  if (existing) { existing.connected = true; return existing; }
+  if (state.phase !== 'lobby' || state.players.length >= 6) return null;
+  const player = {
+    clientId, name, color: PLAYER_COLORS[state.players.length],
+    cash: START_CASH, position: 0, inJail: false, eliminated: false, connected: true
+  };
+  state.players.push(player);
+  return player;
+}
+function startGame(state) {
+  if (state.phase !== 'lobby' || state.players.length < 2) return false;
+  state.phase = 'playing';
+  state.turnIndex = 0;
+  state.turnStage = 'awaiting-roll';
+  state.cardDeck = shuffle(CARDS.map((_, i) => i));
+  logMsg(state, `Game started with ${state.players.length} players!`);
+  logMsg(state, `${currentPlayer(state).name}'s turn.`);
+  return true;
+}
+function drawCard(state) {
+  if (state.cardDeck.length === 0) state.cardDeck = shuffle(CARDS.map((_, i) => i));
+  const cardIdx = state.cardDeck.pop();
+  return CARDS[cardIdx];
+}
+function bankruptPlayer(state, player) {
+  if (player.eliminated) return;
+  player.eliminated = true;
+  player.cash = 0;
+  for (const idxStr of Object.keys(state.propertyOwners)) {
+    if (state.propertyOwners[idxStr] === player.clientId) delete state.propertyOwners[idxStr];
+  }
+  logMsg(state, `${player.name} ran out of money and is out of the game!`);
+}
+function payRent(state, payer, owner, rent) {
+  if (payer.cash >= rent) {
+    payer.cash -= rent; owner.cash += rent;
+    logMsg(state, `${payer.name} paid $${rent} rent to ${owner.name}.`);
+  } else {
+    owner.cash += payer.cash;
+    bankruptPlayer(state, payer);
+  }
+}
+function sendToJail(state, player) { player.position = JAIL_INDEX; player.inJail = true; }
+function applyCardEffect(state, player, card) {
+  logMsg(state, `${player.name} drew: "${card.text}"`);
+  const eff = card.effect;
+  if (eff.type === 'cash') {
+    if (eff.amount >= 0) { player.cash += eff.amount; }
+    else {
+      const cost = -eff.amount;
+      if (player.cash >= cost) player.cash -= cost; else bankruptPlayer(state, player);
+    }
+    state.turnStage = 'awaiting-ack';
+  } else if (eff.type === 'move') {
+    const old = player.position;
+    player.position = (player.position + eff.spaces + BOARD_SIZE) % BOARD_SIZE;
+    if (eff.spaces > 0 && player.position < old) {
+      player.cash += GO_BONUS;
+      logMsg(state, `${player.name} passed GO and collected $${GO_BONUS}!`);
+    }
+    resolveLanding(state, player);
+  } else if (eff.type === 'jail') {
+    sendToJail(state, player);
+    logMsg(state, `${player.name} was sent to Jail!`);
+    state.turnStage = 'awaiting-ack';
+  }
+}
+function resolveLanding(state, player) {
+  if (player.eliminated) { state.turnStage = 'awaiting-ack'; return; }
+  const space = BOARD[player.position];
+  if (space.type === 'go') {
+    logMsg(state, `${player.name} landed on GO!`);
+    state.turnStage = 'awaiting-ack';
+  } else if (space.type === 'property') {
+    const owner = state.propertyOwners[space.idx];
+    if (owner == null) {
+      if (player.cash >= space.price) { state.turnStage = 'awaiting-buy'; }
+      else {
+        logMsg(state, `${player.name} can't afford ${space.name}.`);
+        state.turnStage = 'awaiting-ack';
+      }
+    } else if (owner === player.clientId) {
+      logMsg(state, `${player.name} landed on their own property, ${space.name}.`);
+      state.turnStage = 'awaiting-ack';
+    } else {
+      const ownerPlayer = getPlayer(state, owner);
+      let rent = space.rent;
+      if (ownsFullGroup(state, owner, space.group)) rent *= 2;
+      payRent(state, player, ownerPlayer, rent);
+      state.turnStage = 'awaiting-ack';
+    }
+  } else if (space.type === 'surprise') {
+    const card = drawCard(state);
+    applyCardEffect(state, player, card);
+  } else if (space.type === 'gotojail') {
+    sendToJail(state, player);
+    logMsg(state, `${player.name} was sent to Jail!`);
+    state.turnStage = 'awaiting-ack';
+  } else if (space.type === 'jail') {
+    logMsg(state, `${player.name} is just visiting Jail.`);
+    state.turnStage = 'awaiting-ack';
+  } else if (space.type === 'parking') {
+    player.cash += PARKING_BONUS;
+    logMsg(state, `${player.name} landed on Free Parking and grabbed $${PARKING_BONUS}!`);
+    state.turnStage = 'awaiting-ack';
+  }
+  checkGameEnd(state);
+}
+function actionRollDice(state, clientId) {
+  if (state.phase !== 'playing') return;
+  if (!isCurrentPlayer(state, clientId) || state.turnStage !== 'awaiting-roll') return;
+  const player = currentPlayer(state);
+  if (player.inJail) {
+    player.inJail = false; state.dice = null;
+    logMsg(state, `${player.name} was in Jail — turn skipped!`);
+    state.turnStage = 'awaiting-ack';
+    return;
+  }
+  const d1 = 1 + Math.floor(Math.random() * 6);
+  const d2 = 1 + Math.floor(Math.random() * 6);
+  state.dice = [d1, d2];
+  const steps = d1 + d2;
+  const old = player.position;
+  player.position = (player.position + steps) % BOARD_SIZE;
+  if (player.position < old) {
+    player.cash += GO_BONUS;
+    logMsg(state, `${player.name} passed GO and collected $${GO_BONUS}!`);
+  }
+  resolveLanding(state, player);
+}
+function actionBuyDecision(state, clientId, buy) {
+  if (state.phase !== 'playing') return;
+  if (!isCurrentPlayer(state, clientId) || state.turnStage !== 'awaiting-buy') return;
+  const player = currentPlayer(state);
+  const space = BOARD[player.position];
+  if (buy && player.cash >= space.price) {
+    player.cash -= space.price;
+    state.propertyOwners[space.idx] = player.clientId;
+    logMsg(state, `${player.name} bought ${space.name} for $${space.price}!`);
+  } else {
+    logMsg(state, `${player.name} skipped buying ${space.name}.`);
+  }
+  state.turnStage = 'awaiting-ack';
+}
+function nextTurn(state) {
+  state.dice = null;
+  state.turnCount++;
+  if (checkGameEnd(state)) return;
+  const n = state.players.length;
+  let next = -1;
+  for (let i = 1; i <= n; i++) {
+    const cand = state.players[(state.turnIndex + i) % n];
+    if (!cand.eliminated && cand.connected) { next = (state.turnIndex + i) % n; break; }
+  }
+  if (next === -1) {
+    for (let i = 1; i <= n; i++) {
+      const cand = state.players[(state.turnIndex + i) % n];
+      if (!cand.eliminated) { next = (state.turnIndex + i) % n; break; }
+    }
+  }
+  if (next === -1) { state.phase = 'ended'; return; }
+  state.turnIndex = next;
+  state.turnStage = 'awaiting-roll';
+  logMsg(state, `${state.players[next].name}'s turn.`);
+}
+function actionAck(state, clientId) {
+  if (state.phase !== 'playing') return;
+  if (!isCurrentPlayer(state, clientId) || state.turnStage !== 'awaiting-ack') return;
+  nextTurn(state);
+}
+function checkGameEnd(state) {
+  if (state.phase === 'ended') return true;
+  const alive = state.players.filter(p => !p.eliminated);
+  if (alive.length <= 1) {
+    state.phase = 'ended';
+    state.winnerId = alive[0] ? alive[0].clientId : null;
+    logMsg(state, alive[0] ? `${alive[0].name} wins — everyone else ran out of money!` : 'Game over.');
+    return true;
+  }
+  if (state.turnCount >= MAX_ROUNDS * state.players.length) {
+    let best = null;
+    for (const p of alive) {
+      const worth = p.cash + ownedPropertyValue(state, p.clientId);
+      if (!best || worth > best.worth) best = { p, worth };
+    }
+    state.phase = 'ended';
+    state.winnerId = best.p.clientId;
+    logMsg(state, `Time's up! ${best.p.name} wins with $${best.worth} total worth!`);
+    return true;
+  }
+  return false;
+}
+function handleAction(state, clientId, action, payload) {
+  switch (action) {
+    case 'startGame': startGame(state); break;
+    case 'rollDice': actionRollDice(state, clientId); break;
+    case 'buyDecision': actionBuyDecision(state, clientId, !!(payload && payload.buy)); break;
+    case 'ack': actionAck(state, clientId); break;
+  }
+}
+
+/* =========================================================================
+   PART 2: NETWORKING (PeerJS host/join, host-authoritative broadcast)
+   ========================================================================= */
+
+const PEER_PREFIX = 'propparty-';
+let peer = null;
+let isHost = false;
+let connections = {}; // clientId -> DataConnection (host only)
+let hostConn = null;  // DataConnection to host (client only)
+let myClientId = localStorage.getItem('pp_clientId');
+if (!myClientId) {
+  myClientId = 'p_' + Math.random().toString(36).slice(2, 10);
+  localStorage.setItem('pp_clientId', myClientId);
+}
+let myName = localStorage.getItem('pp_name') || '';
+let state = null; // current game state as seen by this device
+let screen = 'home'; // home | hostLobby | joinForm | joinLobby | game | error
+let errorMsg = '';
+
+function broadcastState() {
+  const payload = { type: 'state', state };
+  for (const cid in connections) {
+    const c = connections[cid];
+    if (c && c.open) { try { c.send(payload); } catch (e) {} }
+  }
+  render();
+}
+
+function hostApply(action, payload, fromClientId) {
+  handleAction(state, fromClientId, action, payload);
+  broadcastState();
+}
+
+function setupHostConnection(conn) {
+  conn.on('data', (data) => {
+    if (data.type === 'hello') {
+      if (state.players.length >= 6 && !getPlayer(state, data.clientId)) {
+        conn.send({ type: 'reject', reason: 'Room is full (6 players max).' });
+        return;
+      }
+      if (state.phase !== 'lobby' && !getPlayer(state, data.clientId)) {
+        conn.send({ type: 'reject', reason: 'Game already started.' });
+        return;
+      }
+      connections[data.clientId] = conn;
+      addPlayer(state, data.clientId, data.name);
+      logMsg(state, `${data.name} joined the game.`);
+      broadcastState();
+    } else if (data.type === 'action') {
+      hostApply(data.action, data.payload, data.clientId);
+    }
+  });
+  conn.on('close', () => {
+    for (const cid in connections) {
+      if (connections[cid] === conn) {
+        const p = getPlayer(state, cid);
+        if (p) { p.connected = false; logMsg(state, `${p.name} disconnected.`); }
+        delete connections[cid];
+      }
+    }
+    broadcastState();
+  });
+}
+
+function startHosting(name, roomCode) {
+  myName = name;
+  localStorage.setItem('pp_name', name);
+  isHost = true;
+  state = createInitialState(roomCode);
+  screen = 'hostLobby';
+  render();
+  peer = new Peer(PEER_PREFIX + roomCode);
+  peer.on('open', () => {
+    addPlayer(state, myClientId, myName);
+    connections[myClientId] = { open: true, send: () => {} }; // host "sends to itself" via direct state
+    render();
+  });
+  peer.on('connection', (conn) => setupHostConnection(conn));
+  peer.on('error', (err) => {
+    errorMsg = err.type === 'unavailable-id'
+      ? 'That room code is already in use. Try a different one.'
+      : 'Connection error: ' + err.type;
+    screen = 'error';
+    render();
+  });
+}
+
+function joinGame(name, roomCode) {
+  myName = name;
+  localStorage.setItem('pp_name', name);
+  isHost = false;
+  screen = 'joinLobby';
+  render();
+  peer = new Peer();
+  peer.on('open', () => {
+    const conn = peer.connect(PEER_PREFIX + roomCode.toUpperCase());
+    hostConn = conn;
+    conn.on('open', () => {
+      conn.send({ type: 'hello', clientId: myClientId, name: myName });
+    });
+    conn.on('data', (data) => {
+      if (data.type === 'state') { state = data.state; render(); }
+      else if (data.type === 'reject') {
+        errorMsg = data.reason;
+        screen = 'error';
+        render();
+      }
+    });
+    conn.on('close', () => {
+      errorMsg = 'Lost connection to the host.';
+      screen = 'error';
+      render();
+    });
+    conn.on('error', () => {
+      errorMsg = "Couldn't find that room. Check the code and try again.";
+      screen = 'error';
+      render();
+    });
+  });
+  peer.on('error', (err) => {
+    errorMsg = 'Connection error: ' + err.type;
+    screen = 'error';
+    render();
+  });
+}
+
+function send(action, payload) {
+  if (isHost) {
+    hostApply(action, payload, myClientId);
+  } else if (hostConn && hostConn.open) {
+    hostConn.send({ type: 'action', action, payload });
+  }
+}
+
+/* =========================================================================
+   PART 3: UI / RENDERING
+   ========================================================================= */
+
+const app = document.getElementById('app');
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function genRoomCode() {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let s = '';
+  for (let i = 0; i < 4; i++) s += letters[Math.floor(Math.random() * letters.length)];
+  return s;
+}
+
+function render() {
+  if (screen === 'home') return renderHome();
+  if (screen === 'hostForm') return renderHostForm();
+  if (screen === 'joinForm') return renderJoinForm();
+  if (screen === 'hostLobby' || screen === 'joinLobby') return renderLobby();
+  if (screen === 'error') return renderError();
+  if (state && (state.phase === 'playing' || state.phase === 'ended')) return renderGame();
+}
+
+function screenShell(innerHtml) {
+  app.innerHTML = `
+    <div class="w-full h-full flex items-center justify-center px-4" style="background: radial-gradient(circle at 30% 20%, #FFF7E6, #FDF6E9 60%);">
+      ${innerHtml}
+    </div>`;
+}
+
+function renderHome() {
+  screenShell(`
+    <div class="pop-in w-full max-w-sm text-center">
+      <div class="text-6xl mb-2">🎲</div>
+      <h1 class="font-display text-4xl font-bold text-amber-600 mb-1">Property Party</h1>
+      <p class="text-slate-500 mb-8">Buy, roll, and win — with your crew.</p>
+      <div class="space-y-3">
+        <button onclick="screen='hostForm'; render();" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">🏠 Host a Game</button>
+        <button onclick="screen='joinForm'; render();" class="w-full py-4 rounded-2xl bg-white hover:bg-slate-50 text-amber-600 font-display text-xl font-semibold shadow-lg border-2 border-amber-200 transition">🔑 Join a Game</button>
+      </div>
+    </div>
+  `);
+}
+
+function renderHostForm() {
+  screenShell(`
+    <div class="pop-in w-full max-w-sm text-center">
+      <h2 class="font-display text-2xl font-bold text-amber-600 mb-6">What's your name?</h2>
+      <input id="nameInput" maxlength="14" value="${esc(myName)}" placeholder="Type your name"
+        class="w-full text-center text-lg px-4 py-3 rounded-xl border-2 border-amber-200 focus:border-amber-400 outline-none mb-4 font-semibold">
+      <button onclick="submitHost()" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">Create Room →</button>
+      <button onclick="screen='home'; render();" class="mt-4 text-slate-400 font-semibold">← Back</button>
+    </div>
+  `);
+  document.getElementById('nameInput').focus();
+}
+
+function submitHost() {
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+  startHosting(name, genRoomCode());
+}
+
+function renderJoinForm() {
+  screenShell(`
+    <div class="pop-in w-full max-w-sm text-center">
+      <h2 class="font-display text-2xl font-bold text-amber-600 mb-6">Join a Game</h2>
+      <input id="nameInput" maxlength="14" value="${esc(myName)}" placeholder="Your name"
+        class="w-full text-center text-lg px-4 py-3 rounded-xl border-2 border-amber-200 focus:border-amber-400 outline-none mb-3 font-semibold">
+      <input id="codeInput" maxlength="4" placeholder="ROOM CODE"
+        class="w-full text-center text-lg px-4 py-3 rounded-xl border-2 border-amber-200 focus:border-amber-400 outline-none mb-4 font-semibold uppercase tracking-widest">
+      <button onclick="submitJoin()" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">Join Room →</button>
+      <button onclick="screen='home'; render();" class="mt-4 text-slate-400 font-semibold">← Back</button>
+    </div>
+  `);
+  document.getElementById('nameInput').focus();
+}
+
+function submitJoin() {
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+  const code = document.getElementById('codeInput').value.trim();
+  if (!code) { alert('Enter the room code your host gave you.'); return; }
+  joinGame(name, code);
+}
+
+function renderError() {
+  screenShell(`
+    <div class="pop-in w-full max-w-sm text-center">
+      <div class="text-6xl mb-4">😕</div>
+      <h2 class="font-display text-2xl font-bold text-rose-500 mb-3">Oops!</h2>
+      <p class="text-slate-500 mb-6">${esc(errorMsg)}</p>
+      <button onclick="location.reload()" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">Start Over</button>
+    </div>
+  `);
+}
+
+function renderLobby() {
+  const players = state.players;
+  const canStart = isHost && players.length >= 2;
+  screenShell(`
+    <div class="pop-in w-full max-w-md text-center">
+      <div class="text-5xl mb-2">🎉</div>
+      <h2 class="font-display text-2xl font-bold text-amber-600 mb-1">Waiting for Players</h2>
+      ${isHost ? `
+        <p class="text-slate-500 mb-1">Tell everyone to join with code:</p>
+        <div class="font-display text-5xl font-bold tracking-widest text-amber-600 bg-white rounded-2xl py-4 mb-6 shadow-inner border-2 border-amber-200">${state.roomCode}</div>
+      ` : `<p class="text-slate-500 mb-6">Waiting for the host to start the game…</p>`}
+      <div class="grid grid-cols-2 gap-2 mb-6">
+        ${players.map(p => `
+          <div class="flex items-center gap-2 bg-white rounded-xl px-3 py-2 shadow border-2" style="border-color:${p.color}">
+            <span class="w-4 h-4 rounded-full flex-shrink-0" style="background:${p.color}"></span>
+            <span class="font-semibold truncate">${esc(p.name)}</span>
+          </div>
+        `).join('')}
+        ${Array.from({length: Math.max(0, 6 - players.length)}).map(() => `
+          <div class="flex items-center gap-2 bg-slate-100 rounded-xl px-3 py-2 border-2 border-dashed border-slate-200 text-slate-300 font-semibold">Empty seat</div>
+        `).join('')}
+      </div>
+      ${canStart ? `<button onclick="send('startGame')" class="w-full py-4 rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white font-display text-xl font-semibold shadow-lg shadow-emerald-200 transition">Start Game! 🚀</button>` : ''}
+      ${isHost && players.length < 2 ? `<p class="text-slate-400 font-semibold">Need at least 2 players to start.</p>` : ''}
+      ${!isHost ? `<p class="text-slate-400 font-semibold">${players.length}/6 players in the room</p>` : ''}
+    </div>
+  `);
+}
+
+// ---- Board geometry: 24 spaces around the perimeter of a 7x7 grid ----
+const GRID_N = 7;
+function cellForBoardIndex(i) {
+  const L = GRID_N - 1;
+  if (i < L) return { row: GRID_N - 1, col: GRID_N - 1 - i };
+  if (i < 2 * L) { const j = i - L; return { row: GRID_N - 1 - j, col: 0 }; }
+  if (i < 3 * L) { const j = i - 2 * L; return { row: 0, col: j }; }
+  const j = i - 3 * L; return { row: j, col: GRID_N - 1 };
+}
+
+function spaceIcon(space) {
+  if (space.icon) return space.icon;
+  return GROUP_ICONS[space.group] || '';
+}
+
+function renderBoardCellContent(space) {
+  const owner = state.propertyOwners[space.idx];
+  const ownerPlayer = owner ? getPlayer(state, owner) : null;
+  const bg = space.group ? GROUP_COLORS[space.group] + '22' : '#ffffff';
+  const border = ownerPlayer ? ownerPlayer.color : (space.group ? GROUP_COLORS[space.group] : '#e2e8f0');
+  const isCorner = ['go', 'jail', 'parking', 'gotojail'].includes(space.type);
+  return `
+    <div class="w-full h-full rounded-md flex flex-col items-center justify-center text-center leading-none border-2 relative"
+         style="background:${isCorner ? '#fff' : bg}; border-color:${border};">
+      <div style="font-size:${isCorner ? '1.1rem' : '0.85rem'}">${spaceIcon(space)}</div>
+      ${space.type === 'property' ? `<div class="text-[0.5rem] font-bold mt-0.5 px-0.5 truncate w-full">${esc(space.name)}</div>
+        <div class="text-[0.45rem] text-slate-500">$${space.price}</div>` : ''}
+      ${ownerPlayer ? `<div class="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border border-white" style="background:${ownerPlayer.color}"></div>` : ''}
+    </div>
+  `;
+}
+
+function renderTokensForCell(i) {
+  const here = state.players.filter(p => !p.eliminated && p.position === i);
+  if (here.length === 0) return '';
+  return `
+    <div class="absolute inset-0 flex flex-wrap items-center justify-center gap-0.5 pointer-events-none">
+      ${here.map(p => `<div class="w-3 h-3 rounded-full border border-white shadow token-bounce" style="background:${p.color}"></div>`).join('')}
+    </div>
+  `;
+}
+
+function renderBoard() {
+  let cells = '';
+  for (let i = 0; i < BOARD_SIZE; i++) {
+    const { row, col } = cellForBoardIndex(i);
+    cells += `<div class="board-cell relative" style="grid-row:${row + 1}; grid-column:${col + 1};">
+      ${renderBoardCellContent(BOARD[i])}
+      ${renderTokensForCell(i)}
+    </div>`;
+  }
+  const cur = currentPlayer(state);
+  const centerContent = state.phase === 'ended' ? renderEndedCenter() : `
+    <div class="text-center px-2">
+      <div class="text-xs text-slate-400 font-semibold mb-1">Turn</div>
+      <div class="font-display text-lg font-bold" style="color:${cur.color}">${esc(cur.name)}</div>
+      ${state.dice ? `<div class="text-3xl mt-1">${diceFace(state.dice[0])} ${diceFace(state.dice[1])}</div>` : ''}
+    </div>
+  `;
+  return `
+    <div class="w-full h-full grid gap-0.5" style="grid-template-columns: repeat(${GRID_N}, 1fr); grid-template-rows: repeat(${GRID_N}, 1fr);">
+      ${cells}
+      <div class="board-cell" style="grid-row: 2 / ${GRID_N}; grid-column: 2 / ${GRID_N}; background:#FDF6E9; border-radius: 0.75rem;">
+        ${centerContent}
+      </div>
+    </div>
+  `;
+}
+
+function diceFace(n) {
+  return ['⚀','⚁','⚂','⚃','⚄','⚅'][n - 1];
+}
+
+function renderEndedCenter() {
+  const winner = state.winnerId ? getPlayer(state, state.winnerId) : null;
+  return `
+    <div class="text-center px-2">
+      <div class="text-3xl mb-1">🏆</div>
+      <div class="font-display text-base font-bold" style="color:${winner ? winner.color : '#333'}">${winner ? esc(winner.name) : 'Game Over'}</div>
+      <div class="text-xs text-slate-500">wins!</div>
+    </div>
+  `;
+}
+
+function renderPlayerList() {
+  const cur = currentPlayer(state);
+  return state.players.map(p => `
+    <div class="flex items-center gap-1.5 px-2 py-1 rounded-lg ${p.clientId === cur.clientId && state.phase === 'playing' ? 'ring-2 ring-offset-1' : ''} ${p.eliminated ? 'opacity-40' : ''}"
+         style="background:${p.color}15; ${p.clientId === cur.clientId ? `--tw-ring-color:${p.color}` : ''}">
+      <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${p.color}"></span>
+      <span class="text-xs font-bold truncate max-w-[4.5rem]">${esc(p.name)}${p.inJail ? ' 🔒' : ''}${!p.connected ? ' 💤' : ''}</span>
+      <span class="text-xs font-semibold text-slate-500">$${p.cash}</span>
+    </div>
+  `).join('');
+}
+
+function renderLog() {
+  const recent = state.log.slice(-6).reverse();
+  return recent.map(l => `<div class="text-xs text-slate-500 truncate">${esc(l)}</div>`).join('');
+}
+
+function renderActionArea() {
+  const me = getPlayer(state, myClientId);
+  const cur = currentPlayer(state);
+  const myTurn = me && cur && me.clientId === cur.clientId && !me.eliminated;
+
+  if (state.phase === 'ended') {
+    return `<div class="text-center text-slate-500 font-semibold py-2">🎊 Thanks for playing! 🎊</div>`;
+  }
+  if (me && me.eliminated) {
+    return `<div class="text-center text-slate-400 font-semibold py-2">You're out — watch the rest of the game!</div>`;
+  }
+  if (!myTurn) {
+    return `<div class="text-center text-slate-400 font-semibold py-2">Waiting for ${esc(cur.name)}…</div>`;
+  }
+  if (state.turnStage === 'awaiting-roll') {
+    return `<button onclick="send('rollDice')" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">🎲 Roll the Dice</button>`;
+  }
+  if (state.turnStage === 'awaiting-buy') {
+    const space = BOARD[me.position];
+    return `
+      <div class="text-center mb-2 font-semibold">Buy <span style="color:${GROUP_COLORS[space.group]}">${esc(space.name)}</span> for $${space.price}?</div>
+      <div class="flex gap-2">
+        <button onclick="send('buyDecision',{buy:true})" class="flex-1 py-3 rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white font-display text-lg font-semibold shadow transition">Buy!</button>
+        <button onclick="send('buyDecision',{buy:false})" class="flex-1 py-3 rounded-2xl bg-slate-200 hover:bg-slate-300 text-slate-600 font-display text-lg font-semibold shadow transition">Skip</button>
+      </div>
+    `;
+  }
+  if (state.turnStage === 'awaiting-ack') {
+    return `<button onclick="send('ack')" class="w-full py-4 rounded-2xl bg-sky-500 hover:bg-sky-600 text-white font-display text-xl font-semibold shadow-lg shadow-sky-200 transition">OK, Next Turn →</button>`;
+  }
+  return '';
+}
+
+function renderGame() {
+  app.innerHTML = `
+    <div class="w-full h-full flex flex-col" style="background:#FDF6E9;">
+      <div class="flex-shrink-0 px-2 pt-2 pb-1 flex flex-wrap gap-1 justify-center border-b border-amber-100 bg-white/60">
+        ${renderPlayerList()}
+      </div>
+      <div class="flex-1 min-h-0 flex items-center justify-center overflow-hidden p-1">
+        <div style="width:min(94vw, 58vh); aspect-ratio:1;">
+          ${renderBoard()}
+        </div>
+      </div>
+      <div class="flex-shrink-0 px-3 pt-1 pb-1 max-h-14 overflow-y-auto no-scrollbar">
+        ${renderLog()}
+      </div>
+      <div class="flex-shrink-0 p-3 bg-white border-t-2 border-amber-100 pop-in" id="actionArea">
+        ${renderActionArea()}
+      </div>
+    </div>
+  `;
+}
+
+// Initial paint
+render();
+</script>
+</body>
+</html>
