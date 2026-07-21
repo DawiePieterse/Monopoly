@@ -351,10 +351,14 @@ let peer = null;
 let isHost = false;
 let connections = {}; // clientId -> DataConnection (host only)
 let hostConn = null;  // DataConnection to host (client only)
-let myClientId = localStorage.getItem('pp_clientId');
+// sessionStorage (not localStorage): persists across a refresh of THIS tab, but
+// each new tab/window gets a fresh identity. Using localStorage here would make
+// two tabs on the same device (a very natural way to first test this) collide
+// into a single player, since they'd share the same clientId.
+let myClientId = sessionStorage.getItem('pp_clientId');
 if (!myClientId) {
   myClientId = 'p_' + Math.random().toString(36).slice(2, 10);
-  localStorage.setItem('pp_clientId', myClientId);
+  sessionStorage.setItem('pp_clientId', myClientId);
 }
 let myName = localStorage.getItem('pp_name') || '';
 let state = null; // current game state as seen by this device
@@ -456,21 +460,28 @@ function startHosting(name, roomCode) {
   });
 }
 
+let joinStatus = 'Connecting to the game server…';
+
 function joinGame(name, roomCode) {
   myName = name;
   localStorage.setItem('pp_name', name);
   isHost = false;
   errorHandled = false;
+  joinStatus = 'Connecting to the game server…';
   screen = 'joinLobby';
   render();
+  console.log('[PropertyParty] joinGame: creating peer…');
   peer = new Peer({ config: ICE_CONFIG });
 
   const myOpenTimer = setTimeout(() => {
     goToError("Couldn't connect to the game server. Check your internet connection and try again.");
   }, PEER_CONNECT_TIMEOUT_MS);
 
-  peer.on('open', () => {
+  peer.on('open', (id) => {
+    console.log('[PropertyParty] peer open, my id =', id, '— connecting to', PEER_PREFIX + roomCode.toUpperCase());
     clearTimeout(myOpenTimer);
+    joinStatus = 'Looking for the room…';
+    render();
     const conn = peer.connect(PEER_PREFIX + roomCode.toUpperCase(), { reliable: true });
     hostConn = conn;
 
@@ -482,23 +493,30 @@ function joinGame(name, roomCode) {
     }, PEER_CONNECT_TIMEOUT_MS);
 
     conn.on('open', () => {
+      console.log('[PropertyParty] data connection open, sending hello');
       clearTimeout(connOpenTimer);
+      joinStatus = 'Connected! Waiting for the host to say hi back…';
+      render();
       conn.send({ type: 'hello', clientId: myClientId, name: myName });
     });
     conn.on('data', (data) => {
+      console.log('[PropertyParty] received', data.type);
       if (data.type === 'state') { state = data.state; render(); }
       else if (data.type === 'reject') { goToError(data.reason); }
     });
     conn.on('close', () => {
+      console.log('[PropertyParty] connection closed');
       goToError('Lost connection to the host.');
     });
-    conn.on('error', () => {
+    conn.on('error', (err) => {
+      console.log('[PropertyParty] connection error', err);
       clearTimeout(connOpenTimer);
       goToError("Couldn't reach that room. Check the code and try again.");
     });
   });
   peer.on('disconnected', () => { peer.reconnect(); });
   peer.on('error', (err) => {
+    console.log('[PropertyParty] peer error', err.type);
     clearTimeout(myOpenTimer);
     if (err.type === 'peer-unavailable') {
       goToError("Couldn't find that room. Double-check the 4-letter code with your host.");
@@ -562,6 +580,7 @@ function renderHome() {
         <button onclick="screen='hostForm'; render();" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">🏠 Host a Game</button>
         <button onclick="screen='joinForm'; render();" class="w-full py-4 rounded-2xl bg-white hover:bg-slate-50 text-amber-600 font-display text-xl font-semibold shadow-lg border-2 border-amber-200 transition">🔑 Join a Game</button>
       </div>
+      <p class="text-[0.65rem] text-slate-300 mt-8">build 2026-07-21 10:36 UTC</p>
     </div>
   `);
 }
@@ -624,6 +643,19 @@ function renderLobby() {
         <div class="text-5xl mb-4 dice-rolling inline-block">🎲</div>
         <h2 class="font-display text-2xl font-bold text-amber-600 mb-2">Setting up your room…</h2>
         <p class="text-slate-500">This only takes a second. Don't share a code yet — it's not ready.</p>
+      </div>
+    `);
+    return;
+  }
+  if (!isHost && !state) {
+    // Joining client: we've kicked off the connection but haven't heard back
+    // from the host yet (no state payload received). Show progress instead of
+    // silently doing nothing (or crashing on state.players below).
+    screenShell(`
+      <div class="pop-in w-full max-w-sm text-center">
+        <div class="text-5xl mb-4 dice-rolling inline-block">🎲</div>
+        <h2 class="font-display text-2xl font-bold text-amber-600 mb-2">Joining room…</h2>
+        <p class="text-slate-500">${esc(joinStatus)}</p>
       </div>
     `);
     return;
