@@ -395,7 +395,8 @@ function setupHostConnection(conn) {
       logMsg(state, `${data.name} joined the game.`);
       broadcastState();
     } else if (data.type === 'action') {
-      hostApply(data.action, data.payload, data.clientId);
+      const senderId = Object.keys(connections).find(cid => connections[cid] === conn);
+      if (senderId) hostApply(data.action, data.payload, senderId);
     }
   });
   conn.on('close', () => {
@@ -532,7 +533,7 @@ function send(action, payload) {
   if (isHost) {
     hostApply(action, payload, myClientId);
   } else if (hostConn && hostConn.open) {
-    hostConn.send({ type: 'action', action, payload });
+    hostConn.send({ type: 'action', action, payload, clientId: myClientId });
   }
 }
 
@@ -580,7 +581,7 @@ function renderHome() {
         <button onclick="screen='hostForm'; render();" class="w-full py-4 rounded-2xl bg-amber-500 hover:bg-amber-600 text-white font-display text-xl font-semibold shadow-lg shadow-amber-200 transition">🏠 Host a Game</button>
         <button onclick="screen='joinForm'; render();" class="w-full py-4 rounded-2xl bg-white hover:bg-slate-50 text-amber-600 font-display text-xl font-semibold shadow-lg border-2 border-amber-200 transition">🔑 Join a Game</button>
       </div>
-      <p class="text-[0.65rem] text-slate-300 mt-8">build 2026-07-21 10:36 UTC</p>
+      <p class="text-[0.65rem] text-slate-300 mt-8">build 2026-07-21 10:47 UTC</p>
     </div>
   `);
 }
@@ -744,7 +745,7 @@ function renderBoard() {
     <div class="text-center px-2">
       <div class="text-xs text-slate-400 font-semibold mb-1">Turn</div>
       <div class="font-display text-lg font-bold" style="color:${cur.color}">${esc(cur.name)}</div>
-      ${state.dice ? `<div class="text-3xl mt-1">${diceFace(state.dice[0])} ${diceFace(state.dice[1])}</div>` : ''}
+      ${state.dice ? `<div class="mt-1" style="font-size:min(16vw, 11vh); line-height:1; filter: drop-shadow(0 2px 3px rgba(0,0,0,0.15));">${diceFace(state.dice[0])} ${diceFace(state.dice[1])}</div>` : ''}
     </div>
   `;
   return `
