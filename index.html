@@ -480,12 +480,15 @@ function genRoomCode() {
 }
 
 function render() {
+  // Game/ended state always takes priority over the screen variable — otherwise
+  // starting the game (which only flips state.phase) would leave everyone stuck
+  // looking at the lobby since `screen` was never separately updated.
+  if (state && (state.phase === 'playing' || state.phase === 'ended')) return renderGame();
   if (screen === 'home') return renderHome();
   if (screen === 'hostForm') return renderHostForm();
   if (screen === 'joinForm') return renderJoinForm();
   if (screen === 'hostLobby' || screen === 'joinLobby') return renderLobby();
   if (screen === 'error') return renderError();
-  if (state && (state.phase === 'playing' || state.phase === 'ended')) return renderGame();
 }
 
 function screenShell(innerHtml) {
