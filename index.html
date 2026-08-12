@@ -559,6 +559,30 @@ let state = null; // current game state as seen by this device
 let screen = 'home'; // home | hostLobby | joinForm | joinLobby | game | error
 let errorMsg = '';
 
+// --- reconnect / resilience state (client) ---
+let netWatchdogTimer = null;  // one persistent loop: host heartbeat sweep, or client stale/reconnect check
+let reconnecting = false;     // guard: a (re)connection attempt is currently in flight
+let reconnectAttempts = 0;    // consecutive failures, drives the backoff delay
+let nextRetryAt = 0;          // Date.now() timestamp before which the watchdog won't retry
+let lastHostActivityAt = 0;   // last time ANY message (incl. pings) arrived from the host
+let joinRoomCode = '';        // remembered so a background reconnect can redial without the join form
+
+// Small fixed-position status pill, appended straight to <body> (not #app) so the
+// state-driven render() functions — which do app.innerHTML = `...` — never wipe it out.
+let netStatusEl = null;
+function showNetStatus(text) {
+  if (!netStatusEl) {
+    netStatusEl = document.createElement('div');
+    netStatusEl.style.cssText = 'position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,0.92);color:#fff;padding:8px 18px;border-radius:999px;font-size:13px;font-weight:600;z-index:9999;box-shadow:0 4px 14px rgba(0,0,0,0.3);pointer-events:none;';
+    document.body.appendChild(netStatusEl);
+  }
+  netStatusEl.textContent = text;
+  netStatusEl.style.display = 'block';
+}
+function hideNetStatus() {
+  if (netStatusEl) netStatusEl.style.display = 'none';
+}
+
 function broadcastState() {
   const payload = { type: 'state', state };
   for (const cid in connections) {
@@ -574,7 +598,10 @@ function hostApply(action, payload, fromClientId) {
 }
 
 function setupHostConnection(conn) {
+  conn._lastActivityAt = Date.now();
+  conn.on('open', () => { conn._lastActivityAt = Date.now(); });
   conn.on('data', (data) => {
+    conn._lastActivityAt = Date.now();
     if (data.type === 'hello') {
       if (state.players.length >= 6 && !getPlayer(state, data.clientId)) {
         conn.send({ type: 'reject', reason: 'Room is full (6 players max).' });
@@ -592,8 +619,9 @@ function setupHostConnection(conn) {
       const senderId = Object.keys(connections).find(cid => connections[cid] === conn);
       if (senderId) hostApply(data.action, data.payload, senderId);
     }
+    // 'pong' needs no handling here — the activity timestamp above is all it's for
   });
-  conn.on('close', () => {
+  const onGone = () => {
     for (const cid in connections) {
       if (connections[cid] === conn) {
         const p = getPlayer(state, cid);
@@ -602,7 +630,60 @@ function setupHostConnection(conn) {
       }
     }
     broadcastState();
-  });
+  };
+  conn.on('close', onGone);
+  conn.on('error', onGone);
+}
+
+// Host heartbeat: ping every connected client every ~6s; if nothing has arrived from
+// them in 20s, the connection is "silently dead" (still technically open per PeerJS,
+// but not actually delivering anything) — close it so setupHostConnection's close
+// handler marks them disconnected and their seat can be reclaimed by a rejoin.
+function hostHeartbeatSweep() {
+  const now = Date.now();
+  for (const cid in connections) {
+    if (cid === myClientId) continue; // host's own "connection" to itself is a stub, not real
+    const conn = connections[cid];
+    if (!conn || !conn.open) continue;
+    if (!conn._lastPingAt || now - conn._lastPingAt > 6000) {
+      conn._lastPingAt = now;
+      try { conn.send({ type: 'ping' }); } catch (e) {}
+    }
+    if (conn._lastActivityAt && now - conn._lastActivityAt > 20000) {
+      try { conn.close(); } catch (e) {}
+    }
+  }
+}
+
+// One persistent loop drives everything network-health related. Client: background
+// auto-retry with backoff + silently-dead-connection detection. Host: heartbeat pings
+// and dead-client sweeps. Runs on a 4s cadence.
+function startNetWatchdog() {
+  if (netWatchdogTimer) return;
+  netWatchdogTimer = setInterval(() => {
+    if (isHost) {
+      hostHeartbeatSweep();
+    } else if (hostConn) {
+      if (hostConn.open && lastHostActivityAt && Date.now() - lastHostActivityAt > 20000) {
+        try { hostConn.close(); } catch (e) {}
+        scheduleReconnect();
+        nextRetryAt = 0; // no need to wait, we KNOW it's dead
+      }
+      if (!hostConn.open && !reconnecting && Date.now() >= nextRetryAt) {
+        connectToHost(false);
+      }
+    }
+  }, 4000);
+}
+
+// Marks the connection as needing a retry, with increasing backoff (2s → 12s cap) so a
+// dead network isn't hammered. The persistent watchdog performs the actual retry.
+function scheduleReconnect() {
+  reconnecting = false;
+  if (isHost) return;
+  reconnectAttempts = Math.min(reconnectAttempts + 1, 6);
+  nextRetryAt = Date.now() + Math.min(2000 * reconnectAttempts, 12000);
+  showNetStatus('Connection lost — retrying…');
 }
 
 const PEER_CONNECT_TIMEOUT_MS = 12000;
@@ -636,6 +717,7 @@ function startHosting(name, roomCode) {
     addPlayer(state, myClientId, myName);
     connections[myClientId] = { open: true, send: () => {} }; // host "sends to itself" via direct state
     render();
+    startNetWatchdog();
   });
   peer.on('connection', (conn) => setupHostConnection(conn));
   peer.on('disconnected', () => {
@@ -661,65 +743,96 @@ function joinGame(name, roomCode) {
   myName = name;
   localStorage.setItem('pp_name', name);
   isHost = false;
+  joinRoomCode = roomCode;
   errorHandled = false;
   joinStatus = 'Connecting to the game server…';
   screen = 'joinLobby';
   render();
-  console.log('[PropertyParty] joinGame: creating peer…');
+  connectToHost(true);
+}
+
+// Builds (or rebuilds) the client's connection to the host. Safe to call repeatedly —
+// used both for the initial join and every automatic reconnect. `isInitial` gates the
+// join-screen status updates and the hard 12s "couldn't connect" error screen, both of
+// which only make sense before ever actually connecting — a background reconnect
+// mid-game should retry quietly behind the current board view (see showNetStatus), not
+// yank the player back to the join screen or declare the room dead after one slow try.
+function connectToHost(isInitial) {
+  if (reconnecting) return;
+  reconnecting = true;
+  if (!isInitial) showNetStatus('Reconnecting…');
+  if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
+  console.log('[PropertyParty] connectToHost: creating peer…');
   peer = new Peer({ config: ICE_CONFIG });
 
-  const myOpenTimer = setTimeout(() => {
+  const myOpenTimer = isInitial ? setTimeout(() => {
     goToError("Couldn't connect to the game server. Check your internet connection and try again.");
-  }, PEER_CONNECT_TIMEOUT_MS);
+  }, PEER_CONNECT_TIMEOUT_MS) : null;
 
   peer.on('open', (id) => {
-    console.log('[PropertyParty] peer open, my id =', id, '— connecting to', PEER_PREFIX + roomCode.toUpperCase());
-    clearTimeout(myOpenTimer);
-    joinStatus = 'Looking for the room…';
-    render();
-    const conn = peer.connect(PEER_PREFIX + roomCode.toUpperCase(), { reliable: true });
+    console.log('[PropertyParty] peer open, my id =', id, '— connecting to', PEER_PREFIX + joinRoomCode.toUpperCase());
+    if (myOpenTimer) clearTimeout(myOpenTimer);
+    if (isInitial) { joinStatus = 'Looking for the room…'; render(); }
+    const conn = peer.connect(PEER_PREFIX + joinRoomCode.toUpperCase(), { reliable: true });
     hostConn = conn;
 
     // The host's room code might not be registered yet, or the host may not exist —
     // PeerJS holds an offer briefly then gives up, so bound it with our own timeout
-    // rather than letting a bad code hang the join screen forever.
-    const connOpenTimer = setTimeout(() => {
+    // rather than letting a bad code hang the join screen forever. Only for the first
+    // attempt — a background reconnect just keeps retrying via the watchdog instead.
+    const connOpenTimer = isInitial ? setTimeout(() => {
       goToError("Couldn't reach that room. Double-check the code with your host — their room may not be ready yet, or the code may be wrong.");
-    }, PEER_CONNECT_TIMEOUT_MS);
+    }, PEER_CONNECT_TIMEOUT_MS) : null;
 
     conn.on('open', () => {
       console.log('[PropertyParty] data connection open, sending hello');
-      clearTimeout(connOpenTimer);
-      joinStatus = 'Connected! Waiting for the host to say hi back…';
-      render();
+      if (connOpenTimer) clearTimeout(connOpenTimer);
+      reconnecting = false;
+      reconnectAttempts = 0;
+      lastHostActivityAt = Date.now();
+      hideNetStatus();
+      if (isInitial) { joinStatus = 'Connected! Waiting for the host to say hi back…'; render(); }
       conn.send({ type: 'hello', clientId: myClientId, name: myName });
+      startNetWatchdog();
     });
     conn.on('data', (data) => {
+      lastHostActivityAt = Date.now();
       console.log('[PropertyParty] received', data.type);
+      if (data.type === 'ping') { try { conn.send({ type: 'pong' }); } catch (e) {} return; }
+      if (data.type === 'pong') return; // heartbeat answer; activity timestamp already updated
       if (data.type === 'state') { state = data.state; render(); }
       else if (data.type === 'reject') { goToError(data.reason); }
     });
     conn.on('close', () => {
       console.log('[PropertyParty] connection closed');
-      goToError('Lost connection to the host.');
+      if (isInitial) { goToError('Lost connection to the host.'); return; }
+      scheduleReconnect();
     });
     conn.on('error', (err) => {
       console.log('[PropertyParty] connection error', err);
-      clearTimeout(connOpenTimer);
-      goToError("Couldn't reach that room. Check the code and try again.");
+      if (connOpenTimer) clearTimeout(connOpenTimer);
+      if (isInitial) { goToError("Couldn't reach that room. Check the code and try again."); return; }
+      scheduleReconnect();
     });
   });
-  peer.on('disconnected', () => { peer.reconnect(); });
+  // Broker (signaling server) hiccup: resume the same peer rather than losing the room code.
+  peer.on('disconnected', () => {
+    try { if (!peer.destroyed) peer.reconnect(); } catch (e) { scheduleReconnect(); }
+  });
   peer.on('error', (err) => {
     console.log('[PropertyParty] peer error', err.type);
-    clearTimeout(myOpenTimer);
-    if (err.type === 'peer-unavailable') {
-      goToError("Couldn't find that room. Double-check the 4-letter code with your host.");
-    } else if (err.type === 'network') {
-      goToError('Lost the connection to the game server. Check your internet and try again.');
-    } else {
-      goToError('Connection error (' + err.type + '). Please try again.');
+    if (myOpenTimer) clearTimeout(myOpenTimer);
+    if (isInitial) {
+      if (err.type === 'peer-unavailable') {
+        goToError("Couldn't find that room. Double-check the 4-letter code with your host.");
+      } else if (err.type === 'network') {
+        goToError('Lost the connection to the game server. Check your internet and try again.');
+      } else {
+        goToError('Connection error (' + err.type + '). Please try again.');
+      }
+      return;
     }
+    scheduleReconnect();
   });
 }
 
